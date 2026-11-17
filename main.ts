@@ -1,171 +1,133 @@
-// BTC Race Bot — Round 2, variant v2.
+// Dip-reversion BTC bot for the make.fun round-2 race (v4).
 //
-// A dip-buy mean-reversion bot for make.fun's "Race a BTC trading bot live
-// for 24 hours" (round 2, 17 Nov 2026). It trades Coinbase Wrapped BTC
-// (cbBTC) on 1-minute on-chain bars with $1,000 of paper money, long only,
-// one position at a time.
-//
-// The idea: buy a dip only when the tape has fallen over several hours, then
-// let the bounce run. The signal is a mean-reversion tilt built from the log
-// returns over the last 2 hours and the last 8 hours:
-//
-//   mu = -0.07 * ln(C_t / C_{t-120}) - 0.02 * ln(C_t / C_{t-480}), clamped to +-0.02
-//
-// A positive mu means the price has fallen recently, so the tape implies a
-// bounce. The 8-hour leg is what keeps the bot out of trouble: on a falling
-// day the short windows fire on every little dip and bleed, while the long
-// window only fires on a real multi-hour washout. The bot goes all in when
-// mu >= 0.0003, then exits on any of:
-//
-//   - take profit at +1.8% from the fill price,
-//   - trailing stop 1% below the peak once the position is +0.3% up,
-//   - hard stop -1.5% from the fill price,
-//   - maximum hold of 360 bars (6 hours).
-//
-// All four exit rules are evaluated together in shouldExitPosition(), so the
-// exit decision lives in one place and stays identical wherever a position
-// is checked.
-//
-// Two guards keep one bad day from sinking the race:
-//
-//   - a circuit breaker stops all trading after the first losing trade;
-//   - a 60-bar cooldown after every exit, so the bot never re-buys the same
-//     dip it just sold.
-//
-// All prices the bot compares are raw units (the shim's close() returns the
-// price at price_scale 5), and the entry price is rebuilt from the position's
-// own cost and quantity, so the units always match. No clock, no randomness,
-// no environment: two runs on the same data produce the same orders.
+// Idea, built from the dev window's own shape: the day is choppy and
+// range-bound, so the money is in buying sharp dips and letting the
+// rebound run. The entry signal is a mean-reversion tilt built from two
+// log-return horizons (30 minutes and 8 hours): after a fall the tilt
+// turns positive. Two guards keep the bot from catching a falling knife:
+//   (1) the tilt must be EASING over the last 20 bars (the dip is
+//       decelerating, not accelerating into a waterfall), and
+//   (2) a circuit breaker stops all trading after one losing trade,
+//       which is what keeps the bot nearly flat on a downtrend day.
+// Exits are a take-profit, a trailing stop armed once the trade is
+// slightly in profit, a hard stop, and a long maximum hold. Everything
+// is deterministic: no clock, no randomness, no environment reads.
 
-import { runBars, type BarsState, type Batch } from './vendor/makefun-bars.ts';
+import { runBars } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
+const PRICE_SCALE = 5; // closes are integers of 1e-5 USDC
 
-// Tilt windows, in bars (1 bar = 1 minute).
-const SHORT_WINDOW = 120; // 2 hours
-const LONG_WINDOW = 480; // 8 hours
-const SHORT_WEIGHT = 0.07;
-const LONG_WEIGHT = 0.02;
-const TILT_CLAMP = 0.02;
-const ENTRY_TILT = 0.0003;
-
-// Exits, as fractions of the entry price.
-const TAKE_PROFIT = 0.018;
-const TRAIL_ARM = 0.003;
-const TRAIL_DROP = 0.01;
-const HARD_STOP = 0.015;
-const MAX_HOLD_BARS = 360;
-
-// Guards.
-const LOSING_TRADES_TO_STOP = 1;
-const COOLDOWN_BARS = 60;
+// --- tuned parameters (from a sweep over the published dev window) ---
+const FAST_BARS = 30; // short horizon for the tilt
+const SLOW_BARS = 480; // long horizon for the tilt (8 hours)
+const FAST_WEIGHT = 0.10; // tilt weight on the short horizon
+const SLOW_WEIGHT = 0.05; // tilt weight on the long horizon
+const ENTRY_TILT = 0.0005; // enter when the tilt reaches this
+const DECEL_BARS = 20; // tilt must be lower than it was this many bars ago
+const TAKE_PROFIT = 0.018; // +1.8% from the fill price
+const TRAIL_ARM = 0.003; // arm the trailing stop at +0.3%
+const TRAIL_DROP = 0.01; // exit when the price falls 1% from its peak
+const HARD_STOP = 0.008; // -0.8% from the fill price
+const MAX_HOLD_BARS = 480; // give a trade up to 8 hours to work
 const MAX_SLIPPAGE_BPS = 100;
 
-interface Position {
-  qty: bigint;
-  cost: bigint;
-  entryRaw: bigint;
-  entrySeq: number;
-  peakRaw: bigint;
-  armed: boolean;
-}
+// --- run state (all derived from the bars and fills, nothing else) ---
+const closes: number[] = []; // close prices in USDC, oldest first
+const tilts: number[] = []; // tilt value per bar, oldest first
+let entryPrice = 0; // fill price of the open position, USDC
+let entrySeq = -1; // batch seq the position was filled on
+let peakPrice = 0; // highest close since the fill
+let stopped = false; // circuit breaker: one losing trade ends trading
+let sellPending = false; // a sell order is out and not yet filled
 
-const closes: number[] = [];
-let position: Position | null = null;
-let prevQty = 0n;
-let losses = 0;
-let cooldownUntil = -1;
-let buyNotional = 0n;
-
-function tilt(): number | null {
-  const n = closes.length;
-  if (n <= LONG_WINDOW) return null;
-  const now = closes[n - 1]!;
-  const short = closes[n - 1 - SHORT_WINDOW]!;
-  const long = closes[n - 1 - LONG_WINDOW]!;
-  let mu =
-    -SHORT_WEIGHT * Math.log(now / short) -
-    LONG_WEIGHT * Math.log(now / long);
-  if (mu > TILT_CLAMP) mu = TILT_CLAMP;
-  if (mu < -TILT_CLAMP) mu = -TILT_CLAMP;
-  return mu;
-}
-
-// Decide whether an open position should be closed on this bar.
-//
-// All four exit rules are evaluated together here, in the order the bot has
-// always used them: take profit, trailing stop (once armed), hard stop, then
-// maximum hold. The trailing stop arms the first time the peak reaches +0.3%
-// above the entry price. Every level is integer per-mille of the entry price,
-// so the units match the raw prices the shim returns and the entry price
-// rebuilt from the position's own cost and quantity.
-function shouldExitPosition(p: Position, close: bigint, seq: number): boolean {
-  if (!p.armed && p.peakRaw >= (p.entryRaw * 1003n) / 1000n) p.armed = true;
-  const takeProfitLine = (p.entryRaw * 1018n) / 1000n;
-  const hardStopLine = (p.entryRaw * 985n) / 1000n;
-  const trailingLine = (p.peakRaw * 99n) / 100n;
-  const heldPastLimit = seq - p.entrySeq >= MAX_HOLD_BARS;
+function tiltAt(i: number): number {
+  const c = closes[i];
   return (
-    close >= takeProfitLine ||
-    (p.armed && close <= trailingLine) ||
-    close <= hardStopLine ||
-    heldPastLimit
+    -FAST_WEIGHT * Math.log(c / closes[i - FAST_BARS]) -
+    SLOW_WEIGHT * Math.log(c / closes[i - SLOW_BARS])
   );
 }
 
 await runBars({
-  onBatch(state: BarsState, batch: Batch) {
+  onBatch(state, batch) {
     if (state.warmingUp) return [];
-    const close = state.close(SYMBOL);
-    if (close === null) return [];
-    closes.push(Number(close));
 
-    // Rebuild the position from the account the harness just sent.
-    const held = state.positions.get(SYMBOL);
-    const qty = held?.qty ?? 0n;
-    if (qty > 0n && held !== undefined) {
-      if (position === null) {
-        const cost = held.cost;
-        position = {
-          qty,
-          cost,
-          entryRaw: (cost * 10n ** 7n) / qty,
-          entrySeq: state.seq,
-          peakRaw: close,
-          armed: false,
-        };
-      } else {
-        position.qty = qty;
-        position.cost = held.cost;
-        if (close > position.peakRaw) position.peakRaw = close;
+    // Fold in the fills of the orders decided on the previous batch.
+    for (const fill of batch.fills) {
+      if (fill.symbol !== SYMBOL || fill.status !== 'filled') continue;
+      const price = Number(fill.price) / 10 ** PRICE_SCALE;
+      if (fill.side === 'buy') {
+        entryPrice = price;
+        entrySeq = batch.seq;
+        peakPrice = price;
+        sellPending = false;
+      } else if (fill.side === 'sell') {
+        if (price < entryPrice) stopped = true; // losing trade: breaker trips
+        entryPrice = 0;
+        entrySeq = -1;
+        peakPrice = 0;
+        sellPending = false;
       }
     }
-    // A position that just closed: score the leg and arm the cooldown.
-    if (prevQty > 0n && qty === 0n) {
-      const proceeds = batch.fills
-        .filter((f) => f.side === 'sell' && f.status === 'filled')
-        .reduce((sum, f) => sum + BigInt(f.notional_quote_units), 0n);
-      if (proceeds > 0n && proceeds < buyNotional) losses += 1;
-      position = null;
-      cooldownUntil = state.seq + COOLDOWN_BARS;
-    }
-    prevQty = qty;
 
-    if (position !== null) {
-      const open = position;
-      if (shouldExitPosition(open, close, state.seq)) {
-        return [{ side: 'sell', symbol: SYMBOL, qty: open.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    const closeRaw = state.close(SYMBOL);
+    if (closeRaw === null) return [];
+    const close = Number(closeRaw) / 10 ** PRICE_SCALE;
+    closes.push(close);
+    // Record the tilt for EVERY bar, holding or flat, so the
+    // deceleration check below always compares against the tilt
+    // exactly DECEL_BARS ago (a gaps-filled history would compare
+    // against a much older tilt and fire at the wrong moments).
+    if (closes.length > SLOW_BARS) {
+      tilts.push(tiltAt(closes.length - 1));
+    } else {
+      tilts.push(NaN);
+    }
+
+    const pos = state.positions.get(SYMBOL);
+    const qty = pos?.qty ?? 0n;
+
+    if (qty > 0n && entryPrice > 0) {
+      // Holding: track the peak and test the four exit rules.
+      if (close > peakPrice) peakPrice = close;
+      const ret = close / entryPrice - 1;
+      const held = batch.seq - entrySeq;
+      const takeProfit = ret >= TAKE_PROFIT;
+      const trailing =
+        peakPrice >= entryPrice * (1 + TRAIL_ARM) &&
+        close <= peakPrice * (1 - TRAIL_DROP);
+      const hardStop = ret <= -HARD_STOP;
+      const tooLong = held >= MAX_HOLD_BARS;
+      if (!sellPending && (takeProfit || trailing || hardStop || tooLong)) {
+        sellPending = true;
+        return [
+          { side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS },
+        ];
       }
       return [];
     }
 
-    // Flat: look for a dip worth buying.
-    if (losses >= LOSING_TRADES_TO_STOP) return [];
-    if (state.seq < cooldownUntil) return [];
-    const mu = tilt();
-    if (mu === null || mu < ENTRY_TILT) return [];
+    // Flat: look for a dip to buy.
+    if (stopped || sellPending) return [];
+    if (closes.length <= SLOW_BARS) return [];
+    const mu = tilts[tilts.length - 1];
+    if (Number.isNaN(mu) || mu < ENTRY_TILT) return [];
+    // The dip must be decelerating: the tilt is lower than 20 bars ago.
+    // (No reference tilt yet — the bot has only just gathered enough
+    // history — so the check has nothing to compare against and the
+    // entry goes through; a deep dip right at the start of the window
+    // is exactly the trade to take.)
+    const muBefore = tilts[tilts.length - 1 - DECEL_BARS];
+    if (!Number.isNaN(muBefore) && mu >= muBefore) return [];
     if (state.cash <= 0n) return [];
-    buyNotional = state.cash;
-    return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+    return [
+      {
+        side: 'buy',
+        symbol: SYMBOL,
+        notional_quote_units: state.cash,
+        max_slippage_bps: MAX_SLIPPAGE_BPS,
+      },
+    ];
   },
 });

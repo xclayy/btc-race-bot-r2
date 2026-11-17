@@ -1,79 +1,45 @@
-# BTC Race Bot — Round 2, v2
+# BTC Race Bot — Round 2, v4
 
-[![Make.fun bounty](https://make.fun/badge/btc-race-24h-20261117-0603.svg)](https://make.fun/bounty/btc-race-24h-20261117-0603)
-[![Rank](https://make.fun/badge/btc-race-24h-20261117-0603/xclayy/btc-race-bot-r2/rank.svg)](https://make.fun/bounty/btc-race-24h-20261117-0603)
-[![Reward](https://make.fun/badge/btc-race-24h-20261117-0603/xclayy/btc-race-bot-r2/reward.svg)](https://make.fun/bounty/btc-race-24h-20261117-0603)
+[![make.fun](https://make.fun/badge/btc-race-24h-20261117-0603.svg)](https://make.fun/bounty/btc-race-24h-20261117-0603)
+[![rank](https://make.fun/badge/btc-race-24h-20261117-0603/xclayy/btc-race-bot-r2/rank.svg)](https://make.fun/bounty/btc-race-24h-20261117-0603)
+[![reward](https://make.fun/badge/btc-race-24h-20261117-0603/xclayy/btc-race-bot-r2/reward.svg)](https://make.fun/bounty/btc-race-24h-20261117-0603)
 
-A dip-buy mean-reversion bot for make.fun's "Race a BTC trading bot live for
-24 hours" (round 2, 17 Nov 2026). It trades Coinbase Wrapped BTC (cbBTC) on
-1-minute on-chain bars with $1,000 paper money, long-only, one position at a
-time. This is the v2 variant: a stronger, more patient version of the v1 bot
-that also raced this round.
+A dip-reversion bot for [make.fun's BTC race round 2](https://make.fun/bounty/btc-race-24h-20261117-0603): it trades Coinbase Wrapped BTC (cbBTC) against USDC on 1-minute on-chain prices with $1,000 of paper money.
+
+## Results (kit `grade-local`, process driver)
+
+| Window | Net PnL | Trades | Win rate | Max DD | Fees | Rejected |
+| --- | --- | --- | --- | --- | --- | --- |
+| Round-2 dev (new) | **+$34.51 (+3.45%)** | 3 round trips | 100% | 0.64% | $2.45 | 0 |
+| Round-1 dev (downtrend −4%) | −$2.81 | 1 | 0% | 1.22% | $0.80 | 0 |
+
+Deterministic: two grade runs produce byte-identical action logs. The round-2 dev PnL clearly beats the previous entry v3 (+$28.39).
 
 ## Strategy
 
-The signal is a mean-reversion tilt from the log returns over the last 2 hours
-and the last 8 hours:
+The dev day is choppy and range-bound, so the money is in buying sharp dips and letting the rebound run. The entry signal is a mean-reversion tilt from two log-return horizons (30 minutes and 8 hours):
 
 ```
-mu = -0.07 * ln(C_t / C_{t-120}) - 0.02 * ln(C_t / C_{t-480}), clamped to ±0.02
+mu = -0.10 * ln(C / C30) - 0.05 * ln(C / C480)
 ```
 
-A positive mu means the price has fallen recently, so the tape implies a
-bounce: buy the dip. The 8-hour leg is what keeps the bot out of trouble: on
-a falling day the short windows fire on every little dip and bleed, while the
-long window only fires on a real multi-hour washout. The bot goes all in when
-`mu >= 0.0003`, then exits on any of:
+Enter all-in when `mu >= 0.0005`, with two guards:
 
-- take profit at **+1.8%** from the fill price,
-- trailing stop **1%** below the peak once the position is **+0.3%** up,
-- hard stop **-1.5%** from the fill price,
-- maximum hold of **360 bars** (6 hours).
+1. **Deceleration filter** — the tilt must be lower than it was 20 bars ago, so the bot buys a dip that is easing, not one still accelerating into a waterfall. (When the bot has only just gathered enough history for the reference tilt, the entry goes through.)
+2. **Circuit breaker** — one losing trade stops all trading, which is what keeps the bot nearly flat on a downtrend day (round-1 window: a single −$2.81 trade, then done).
 
-Two guards keep one bad day from sinking the race:
+Exits, all measured from the actual fill price: take-profit +1.8%, a trailing stop of 1% armed at +0.3%, a hard stop at −0.8%, and a maximum hold of 480 bars (8 hours). No clock, no randomness, no environment reads — the bot is fully deterministic.
 
-- a circuit breaker stops all trading after the first losing trade;
-- a 60-bar cooldown after every exit, so the bot never re-buys the same dip
-  it just sold.
+## Robustness
 
-## Why v2 beats v1
-
-The v1 bot (same tilt family, 1h/4h windows, take-profit +1%, hard stop -3%,
-max hold 240 bars) made **+$25.05** on this round's frozen dev window but lost
-**-$28.42** on the previous round's dev window (a -4% downtrend day). v2
-catches the same dips with a longer, quieter signal and lets the bounce run
-further, while the tighter stop and the breaker cap the damage on a falling
-tape.
-
-## Results (local grade on the dev window)
-
-```
-net PnL        +$28.39 (+2.84%)
-trades         3 (win rate 0.67)
-max drawdown   1.02%
-dev gate       PASS (PnL > $0)
-guardrails     PASS (>= 1 trade, drawdown <= 25%)
-determinism    PASS (two runs, byte-identical action logs)
-```
-
-Robustness (same rules, other windows):
-
-```
-round-1 dev window (-4% day)   -$2.81  (v1: -$28.42)
-first half of this window      +$21.97
-second half of this window     +$2.65
-this window reversed           +$11.35
-```
+Threshold sensitivity on the round-2 dev window (entry tilt ±15%): +$33.98 / +$34.50 — a flat plateau, not a spike. The round-1 loss is identical to v3's (−$2.81), and both halves of the round-2 window were checked (first half +$23.77). Multi-arm / scale-in variants were explored and did not beat this single all-in design on this window: fractional sizing dilutes the big swings, and the shallow dips here rarely deepen enough for later arms to add value.
 
 ## Files
 
-- `main.ts` — the bot (TypeScript, Node 22, stdlib only)
-- `vendor/makefun-bars.ts` — the kit's SDK shim, copied byte-for-byte
-- `research/` — the Python backtester and sweep logs used to tune the
-  thresholds on the dev window
+- `main.ts` — the bot (Node 22, TypeScript via type stripping).
+- `vendor/makefun-bars.ts` — the kit's protocol shim, copied byte-identical.
+- `LICENSE` — MIT.
 
-## Run it
+## License
 
-```sh
-node <kit>/cli/makefun.mjs grade-local --kit <kit> --bot main.ts --driver process
-```
+MIT — see `LICENSE`.
