@@ -22,6 +22,10 @@
 //   - hard stop -1.5% from the fill price,
 //   - maximum hold of 360 bars (6 hours).
 //
+// All four exit rules are evaluated together in shouldExitPosition(), so the
+// exit decision lives in one place and stays identical wherever a position
+// is checked.
+//
 // Two guards keep one bad day from sinking the race:
 //
 //   - a circuit breaker stops all trading after the first losing trade;
@@ -87,6 +91,28 @@ function tilt(): number | null {
   return mu;
 }
 
+// Decide whether an open position should be closed on this bar.
+//
+// All four exit rules are evaluated together here, in the order the bot has
+// always used them: take profit, trailing stop (once armed), hard stop, then
+// maximum hold. The trailing stop arms the first time the peak reaches +0.3%
+// above the entry price. Every level is integer per-mille of the entry price,
+// so the units match the raw prices the shim returns and the entry price
+// rebuilt from the position's own cost and quantity.
+function shouldExitPosition(p: Position, close: bigint, seq: number): boolean {
+  if (!p.armed && p.peakRaw >= (p.entryRaw * 1003n) / 1000n) p.armed = true;
+  const takeProfitLine = (p.entryRaw * 1018n) / 1000n;
+  const hardStopLine = (p.entryRaw * 985n) / 1000n;
+  const trailingLine = (p.peakRaw * 99n) / 100n;
+  const heldPastLimit = seq - p.entrySeq >= MAX_HOLD_BARS;
+  return (
+    close >= takeProfitLine ||
+    (p.armed && close <= trailingLine) ||
+    close <= hardStopLine ||
+    heldPastLimit
+  );
+}
+
 await runBars({
   onBatch(state: BarsState, batch: Batch) {
     if (state.warmingUp) return [];
@@ -126,19 +152,9 @@ await runBars({
     prevQty = qty;
 
     if (position !== null) {
-      const p = position;
-      if (!p.armed && p.peakRaw >= (p.entryRaw * 1003n) / 1000n) p.armed = true;
-      const takeProfit = (p.entryRaw * 1018n) / 1000n;
-      const hardStop = (p.entryRaw * 985n) / 1000n;
-      const trailLine = (p.peakRaw * 99n) / 100n;
-      const heldTooLong = state.seq - p.entrySeq >= MAX_HOLD_BARS;
-      if (
-        close >= takeProfit ||
-        (p.armed && close <= trailLine) ||
-        close <= hardStop ||
-        heldTooLong
-      ) {
-        return [{ side: 'sell', symbol: SYMBOL, qty: p.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+      const open = position;
+      if (shouldExitPosition(open, close, state.seq)) {
+        return [{ side: 'sell', symbol: SYMBOL, qty: open.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
       return [];
     }
