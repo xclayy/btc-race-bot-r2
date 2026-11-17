@@ -1,149 +1,155 @@
-// BTC Race Bot — round 2 (btc-race-24h-20261117-0603)
+// BTC Race Bot — Round 2, variant v2.
 //
-// Dip-buy mean reversion on the forecast tilt, all-in, one position at a
-// time. The tilt is the expected 4-hour log-return of cbBTC implied by the
-// recent tape:
+// A dip-buy mean-reversion bot for make.fun's "Race a BTC trading bot live
+// for 24 hours" (round 2, 17 Nov 2026). It trades Coinbase Wrapped BTC
+// (cbBTC) on 1-minute on-chain bars with $1,000 of paper money, long only,
+// one position at a time.
 //
-//   mu = -0.05 * ln(C_t / C_{t-60}) - 0.03 * ln(C_t / C_{t-240}), clamped to +-0.02
+// The idea: buy a dip only when the tape has fallen over several hours, then
+// let the bounce run. The signal is a mean-reversion tilt built from the log
+// returns over the last 2 hours and the last 8 hours:
 //
-// A positive mu means the price has fallen over the last hour and four
-// hours, so the tape implies a bounce: buy the dip. The thresholds were
-// tuned on this round's frozen 24-hour dev window (1,440 bars, range-bound
-// $63,874-$65,467, net +0.49%):
+//   mu = -0.07 * ln(C_t / C_{t-120}) - 0.02 * ln(C_t / C_{t-480}), clamped to +-0.02
 //
-//   - Enter when mu >= 0.0003. The previous round's gated-wait entry
-//     (mu >= 0.0018) never fired once on this window — its mu tops out at
-//     +0.0013 — so the entry bar has to sit where dips actually happen.
-//   - Take profit at +1% from the fill, trailing stop 2% once the position
-//     is +0.5% up, hard stop -3%, and a 240-bar (4h) maximum hold.
-//   - Circuit breaker: after the first losing trade, stop trading for the
-//     rest of the window. On the dev window the bot's four trades are three
-//     wins and one small loss, so the breaker never fires there; on a
-//     falling tape it caps the damage instead of catching every knife.
+// A positive mu means the price has fallen recently, so the tape implies a
+// bounce. The 8-hour leg is what keeps the bot out of trouble: on a falling
+// day the short windows fire on every little dip and bleed, while the long
+// window only fires on a real multi-hour washout. The bot goes all in when
+// mu >= 0.0003, then exits on any of:
 //
-// Backtest (local replay of the dev window, harness fill model: fill at the
-// next bar's open, 4 bps fee, 2 bps slippage, constant-product impact
-// against the bar's open depth): net PnL +$24.39, 4 trades, max drawdown
-// 1.1% — comfortably above the dev gate (PnL > $0) and inside the race
-// guardrails (>= 1 trade, drawdown <= 25%). The same rules on the previous
-// round's dev window (a -4% downtrend day) lose only -$28.42 with the
-// breaker, versus -$77 without it.
+//   - take profit at +1.8% from the fill price,
+//   - trailing stop 1% below the peak once the position is +0.3% up,
+//   - hard stop -1.5% from the fill price,
+//   - maximum hold of 360 bars (6 hours).
 //
-// Deterministic: every decision comes from the bars and the constants
-// below. No clock, no environment, no randomness.
+// Two guards keep one bad day from sinking the race:
+//
+//   - a circuit breaker stops all trading after the first losing trade;
+//   - a 60-bar cooldown after every exit, so the bot never re-buys the same
+//     dip it just sold.
+//
+// All prices the bot compares are raw units (the shim's close() returns the
+// price at price_scale 5), and the entry price is rebuilt from the position's
+// own cost and quantity, so the units always match. No clock, no randomness,
+// no environment: two runs on the same data produce the same orders.
 
-import { runBars, type BarsState, type BuyInput, type OrderInput } from './vendor/makefun-bars.ts';
+import { runBars, type BarsState, type Batch } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
 
-// --- strategy constants (tuned on this round's dev window) ---
-const ENTRY_TILT = 0.0003;
+// Tilt windows, in bars (1 bar = 1 minute).
+const SHORT_WINDOW = 120; // 2 hours
+const LONG_WINDOW = 480; // 8 hours
+const SHORT_WEIGHT = 0.07;
+const LONG_WEIGHT = 0.02;
 const TILT_CLAMP = 0.02;
-const TAKE_PROFIT = 0.01; // +1% from the fill price
-const TRAIL_ARM = 0.005; // trailing stop arms once +0.5% up
-const TRAIL = 0.02; // trailing stop trails 2% below the peak
-const STOP = 0.03; // hard stop -3% from the fill price
-const MAX_HOLD = 240; // bars (4 hours)
-const MAX_LOSSES = 1; // circuit breaker: stop after the first losing trade
+const ENTRY_TILT = 0.0003;
+
+// Exits, as fractions of the entry price.
+const TAKE_PROFIT = 0.018;
+const TRAIL_ARM = 0.003;
+const TRAIL_DROP = 0.01;
+const HARD_STOP = 0.015;
+const MAX_HOLD_BARS = 360;
+
+// Guards.
+const LOSING_TRADES_TO_STOP = 1;
+const COOLDOWN_BARS = 60;
 const MAX_SLIPPAGE_BPS = 100;
-const HISTORY_BARS = 240; // closes needed before the tilt exists
 
-// --- state ---
+interface Position {
+  qty: bigint;
+  cost: bigint;
+  entryRaw: bigint;
+  entrySeq: number;
+  peakRaw: bigint;
+  armed: boolean;
+}
+
 const closes: number[] = [];
-let entryPrice = 0; // fill price, in the raw units state.close() returns
-let entrySeq = -1; // seq of the batch where the position first appeared
-let peak = 0; // highest close seen while holding
-let entryCash = 0n; // cash held just before the buy (to judge win / loss)
-let pendingSell = false; // a sell was decided; its fill is due next batch
+let position: Position | null = null;
+let prevQty = 0n;
 let losses = 0;
-let stopped = false;
+let cooldownUntil = -1;
+let buyNotional = 0n;
 
-/** The tilt at the latest close, or null before 240 closes exist. */
 function tilt(): number | null {
-  const k = closes.length - 1;
-  if (k < HISTORY_BARS) return null;
-  const r60 = Math.log(closes[k] / closes[k - 60]);
-  const r240 = Math.log(closes[k] / closes[k - HISTORY_BARS]);
-  const mu = -0.05 * r60 - 0.03 * r240;
-  if (mu > TILT_CLAMP) return TILT_CLAMP;
-  if (mu < -TILT_CLAMP) return -TILT_CLAMP;
+  const n = closes.length;
+  if (n <= LONG_WINDOW) return null;
+  const now = closes[n - 1]!;
+  const short = closes[n - 1 - SHORT_WINDOW]!;
+  const long = closes[n - 1 - LONG_WINDOW]!;
+  let mu =
+    -SHORT_WEIGHT * Math.log(now / short) -
+    LONG_WEIGHT * Math.log(now / long);
+  if (mu > TILT_CLAMP) mu = TILT_CLAMP;
+  if (mu < -TILT_CLAMP) mu = -TILT_CLAMP;
   return mu;
 }
 
 await runBars({
-  onBatch(state: BarsState): OrderInput[] {
+  onBatch(state: BarsState, batch: Batch) {
     if (state.warmingUp) return [];
-    const closeRaw = state.close(SYMBOL);
-    if (closeRaw === null) return [];
-    const close = Number(closeRaw);
-    closes.push(close);
+    const close = state.close(SYMBOL);
+    if (close === null) return [];
+    closes.push(Number(close));
 
-    const pos = state.positions.get(SYMBOL);
-
-    if (pos !== undefined) {
-      // Holding. If a sell was decided last batch and the position is
-      // still here, that sell was rejected: clear the flag and re-decide.
-      if (pendingSell) pendingSell = false;
-      // First sight of the position: the buy filled on this bar.
-      if (entrySeq < 0) {
-        // Entry price in the same raw units state.close() returns
-        // (price_scale 5): cost is quote units (1e-6 USDC), qty is 1e-8
-        // BTC, so price_raw = cost * 1e7 / qty. (cost includes the 4 bps
-        // fee, so this sits ~4 bps above the true fill — immaterial
-        // against the 1% / 3% exits.)
-        entryPrice = (Number(pos.cost) * 10_000_000) / Number(pos.qty);
-        entrySeq = state.seq;
-        peak = close;
+    // Rebuild the position from the account the harness just sent.
+    const held = state.positions.get(SYMBOL);
+    const qty = held?.qty ?? 0n;
+    if (qty > 0n && held !== undefined) {
+      if (position === null) {
+        const cost = held.cost;
+        position = {
+          qty,
+          cost,
+          entryRaw: (cost * 10n ** 7n) / qty,
+          entrySeq: state.seq,
+          peakRaw: close,
+          armed: false,
+        };
+      } else {
+        position.qty = qty;
+        position.cost = held.cost;
+        if (close > position.peakRaw) position.peakRaw = close;
       }
-      if (close > peak) peak = close;
+    }
+    // A position that just closed: score the leg and arm the cooldown.
+    if (prevQty > 0n && qty === 0n) {
+      const proceeds = batch.fills
+        .filter((f) => f.side === 'sell' && f.status === 'filled')
+        .reduce((sum, f) => sum + BigInt(f.notional_quote_units), 0n);
+      if (proceeds > 0n && proceeds < buyNotional) losses += 1;
+      position = null;
+      cooldownUntil = state.seq + COOLDOWN_BARS;
+    }
+    prevQty = qty;
 
-      const takeProfit = close >= entryPrice * (1 + TAKE_PROFIT);
-      const trailing =
-        peak >= entryPrice * (1 + TRAIL_ARM) && close <= peak * (1 - TRAIL);
-      const stopOut = close <= entryPrice * (1 - STOP);
-      const heldTooLong = state.seq - entrySeq >= MAX_HOLD;
-      if (takeProfit || trailing || stopOut || heldTooLong) {
-        pendingSell = true;
-        return [
-          {
-            side: 'sell',
-            symbol: SYMBOL,
-            qty: pos.qty,
-            max_slippage_bps: MAX_SLIPPAGE_BPS,
-          },
-        ];
+    if (position !== null) {
+      const p = position;
+      if (!p.armed && p.peakRaw >= (p.entryRaw * 1003n) / 1000n) p.armed = true;
+      const takeProfit = (p.entryRaw * 1018n) / 1000n;
+      const hardStop = (p.entryRaw * 985n) / 1000n;
+      const trailLine = (p.peakRaw * 99n) / 100n;
+      const heldTooLong = state.seq - p.entrySeq >= MAX_HOLD_BARS;
+      if (
+        close >= takeProfit ||
+        (p.armed && close <= trailLine) ||
+        close <= hardStop ||
+        heldTooLong
+      ) {
+        return [{ side: 'sell', symbol: SYMBOL, qty: p.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
       return [];
     }
 
-    // Flat. If a sell was decided last batch and the position is gone, it
-    // filled: judge it against the cash held before the buy.
-    if (pendingSell) {
-      pendingSell = false;
-      if (state.cash < entryCash) {
-        losses += 1;
-        if (losses >= MAX_LOSSES) stopped = true;
-      }
-    }
-
-    if (stopped) return [];
+    // Flat: look for a dip worth buying.
+    if (losses >= LOSING_TRADES_TO_STOP) return [];
+    if (state.seq < cooldownUntil) return [];
     const mu = tilt();
     if (mu === null || mu < ENTRY_TILT) return [];
-
-    // All in: spend the cash, capped by the weight room (100% of equity).
-    const room = state.weightRoom(SYMBOL);
-    const notional = state.cash < room ? state.cash : room;
-    if (notional <= 0n) return [];
-    entryCash = state.cash;
-    entrySeq = -1;
-    entryPrice = 0;
-    peak = 0;
-    const order: BuyInput = {
-      side: 'buy',
-      symbol: SYMBOL,
-      notional_quote_units: notional,
-      max_slippage_bps: MAX_SLIPPAGE_BPS,
-    };
-    return [order];
+    if (state.cash <= 0n) return [];
+    buyNotional = state.cash;
+    return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: state.cash, max_slippage_bps: MAX_SLIPPAGE_BPS }];
   },
 });
